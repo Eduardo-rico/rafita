@@ -1,0 +1,5 @@
+.rafita/logs/
+.rafita/status.json
+.rafita/progress.json
+.rafita/runtime_prompt_*.md
+.DS_Store
