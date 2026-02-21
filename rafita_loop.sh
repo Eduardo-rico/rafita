@@ -54,6 +54,7 @@ CLAUDE_CMD="claude"
 MAX_CALLS_PER_HOUR=100
 TIMEOUT_MINUTES=20
 MAX_LOOPS=0
+MIN_LOOPS=5
 SLEEP_BETWEEN_LOOPS=2
 CB_NO_PROGRESS_THRESHOLD=3
 CB_FAILURE_THRESHOLD=5
@@ -62,6 +63,7 @@ VERBOSE=false
 
 FORWARD_ARGS=()
 PROVIDER_OVERRIDE=""
+MIN_LOOPS_OVERRIDE=""
 MONITOR_MODE=false
 
 usage() {
@@ -73,6 +75,7 @@ Usage: rafita [options]
 Options:
   --provider <codex|kimi|claude>  Explicit provider selection (no automatic fallback)
   --monitor                        Run inside tmux with live monitor pane
+  --min-loops <n>                  Require at least n loops before allowing completion
   --max-loops <n>                  Stop after n loops (0 = unlimited)
   --timeout <minutes>              Timeout per provider invocation
   --verbose                        Verbose logs
@@ -94,6 +97,47 @@ load_rafitarc() {
         # shellcheck source=/dev/null
         source ".rafitarc"
     fi
+}
+
+is_non_negative_int() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+fix_plan_has_pending_tasks() {
+    local fix_plan_file=$1
+
+    if [[ ! -f "$fix_plan_file" ]]; then
+        return 1
+    fi
+
+    if grep -Eq '^[[:space:]]*-[[:space:]]*\[[[:space:]]\]' "$fix_plan_file"; then
+        return 0
+    fi
+
+    return 1
+}
+
+completion_gate_reason() {
+    local loop_count=$1
+    local reasons=()
+
+    if (( loop_count < MIN_LOOPS )); then
+        reasons+=("min_loops_not_met(${loop_count}/${MIN_LOOPS})")
+    fi
+
+    if fix_plan_has_pending_tasks "$FIX_PLAN_FILE"; then
+        reasons+=("pending_fix_plan_tasks")
+    fi
+
+    if (( ${#reasons[@]} == 0 )); then
+        echo ""
+        return 1
+    fi
+
+    local joined
+    joined=$(IFS=','; echo "${reasons[*]}")
+    echo "$joined"
+    return 0
 }
 
 ensure_rafita_structure() {
@@ -237,6 +281,15 @@ parse_args() {
                 MONITOR_MODE=true
                 shift
                 ;;
+            --min-loops)
+                MIN_LOOPS_OVERRIDE=${2:-}
+                if [[ -z "${MIN_LOOPS_OVERRIDE}" ]] || ! is_non_negative_int "${MIN_LOOPS_OVERRIDE}"; then
+                    echo "Invalid --min-loops value: '${2:-}'. Expected a non-negative integer."
+                    exit 1
+                fi
+                FORWARD_ARGS+=("--min-loops" "$MIN_LOOPS_OVERRIDE")
+                shift 2
+                ;;
             --max-loops)
                 MAX_LOOPS=${2:-0}
                 FORWARD_ARGS+=("--max-loops" "$MAX_LOOPS")
@@ -271,6 +324,15 @@ main() {
 
     if [[ -n "$PROVIDER_OVERRIDE" ]]; then
         PROVIDER="$PROVIDER_OVERRIDE"
+    fi
+
+    if [[ -n "$MIN_LOOPS_OVERRIDE" ]]; then
+        MIN_LOOPS="$MIN_LOOPS_OVERRIDE"
+    fi
+
+    if ! is_non_negative_int "$MIN_LOOPS"; then
+        echo "Invalid MIN_LOOPS value '$MIN_LOOPS' in .rafitarc. Expected a non-negative integer."
+        exit 1
     fi
 
     if ! provider_validate "$PROVIDER"; then
@@ -367,6 +429,17 @@ main() {
             fi
         else
             cb_on_no_progress
+        fi
+
+        if [[ "$status" == "COMPLETE" && "$exit_signal" == "true" ]]; then
+            local gate_reason
+            gate_reason=$(completion_gate_reason "$loop_count" || true)
+            if [[ -n "$gate_reason" ]]; then
+                log_line "INFO" "Completion requested by provider but continuing: $gate_reason"
+                status="IN_PROGRESS"
+                exit_signal="false"
+                recommendation="${recommendation}; forced_continue=${gate_reason}"
+            fi
         fi
 
         write_status_json "$loop_count" "$status" "$exit_signal" "$tasks_completed" "$files_modified" "$tests_status" "$work_type" "$recommendation" "$provider_exit"
