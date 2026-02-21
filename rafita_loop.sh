@@ -55,6 +55,8 @@ MAX_CALLS_PER_HOUR=100
 TIMEOUT_MINUTES=20
 MAX_LOOPS=0
 MIN_LOOPS=5
+LIVE_OUTPUT=false
+COMPLETION_INDICATOR_THRESHOLD=2
 SLEEP_BETWEEN_LOOPS=2
 CB_NO_PROGRESS_THRESHOLD=3
 CB_FAILURE_THRESHOLD=5
@@ -64,6 +66,8 @@ VERBOSE=false
 FORWARD_ARGS=()
 PROVIDER_OVERRIDE=""
 MIN_LOOPS_OVERRIDE=""
+LIVE_OUTPUT_OVERRIDE=""
+COMPLETION_THRESHOLD_OVERRIDE=""
 MONITOR_MODE=false
 
 usage() {
@@ -75,7 +79,9 @@ Usage: rafita [options]
 Options:
   --provider <codex|kimi|claude>  Explicit provider selection (no automatic fallback)
   --monitor                        Run inside tmux with live monitor pane
+  --live                           Stream provider output to terminal while logging
   --min-loops <n>                  Require at least n loops before allowing completion
+  --completion-threshold <n>       Required completion indicators before allowing exit
   --max-loops <n>                  Stop after n loops (0 = unlimited)
   --timeout <minutes>              Timeout per provider invocation
   --verbose                        Verbose logs
@@ -103,6 +109,26 @@ is_non_negative_int() {
     [[ "$1" =~ ^[0-9]+$ ]]
 }
 
+completion_indicator_count() {
+    local output_file=$1
+    local count=0
+    local -a patterns=(
+        "all tasks (are )?complete"
+        "all requested changes (are )?implemented"
+        "no further (changes|work) (required|needed)"
+        "implementation (is )?complete"
+        "ready for review"
+    )
+
+    for pattern in "${patterns[@]}"; do
+        if grep -Eiq "$pattern" "$output_file"; then
+            count=$((count + 1))
+        fi
+    done
+
+    echo "$count"
+}
+
 fix_plan_has_pending_tasks() {
     local fix_plan_file=$1
 
@@ -119,10 +145,15 @@ fix_plan_has_pending_tasks() {
 
 completion_gate_reason() {
     local loop_count=$1
+    local completion_indicators=$2
     local reasons=()
 
     if (( loop_count < MIN_LOOPS )); then
         reasons+=("min_loops_not_met(${loop_count}/${MIN_LOOPS})")
+    fi
+
+    if (( completion_indicators < COMPLETION_INDICATOR_THRESHOLD )); then
+        reasons+=("completion_indicators_low(${completion_indicators}/${COMPLETION_INDICATOR_THRESHOLD})")
     fi
 
     if fix_plan_has_pending_tasks "$FIX_PLAN_FILE"; then
@@ -161,6 +192,7 @@ write_status_json() {
     local work_type=$7
     local recommendation=$8
     local provider_exit=$9
+    local completion_indicators=${10}
 
     local rec_safe
     rec_safe=$(sanitize_json_string "$recommendation")
@@ -178,6 +210,8 @@ write_status_json() {
   "work_type": "${work_type}",
   "recommendation": "${rec_safe}",
   "provider_exit_code": ${provider_exit},
+  "completion_indicators_detected": ${completion_indicators},
+  "completion_indicator_threshold": ${COMPLETION_INDICATOR_THRESHOLD},
   "calls_made_this_hour": $(rate_limit_current_calls),
   "max_calls_per_hour": ${MAX_CALLS_PER_HOUR}
 }
@@ -281,6 +315,11 @@ parse_args() {
                 MONITOR_MODE=true
                 shift
                 ;;
+            --live)
+                LIVE_OUTPUT_OVERRIDE="true"
+                FORWARD_ARGS+=("--live")
+                shift
+                ;;
             --min-loops)
                 MIN_LOOPS_OVERRIDE=${2:-}
                 if [[ -z "${MIN_LOOPS_OVERRIDE}" ]] || ! is_non_negative_int "${MIN_LOOPS_OVERRIDE}"; then
@@ -288,6 +327,15 @@ parse_args() {
                     exit 1
                 fi
                 FORWARD_ARGS+=("--min-loops" "$MIN_LOOPS_OVERRIDE")
+                shift 2
+                ;;
+            --completion-threshold)
+                COMPLETION_THRESHOLD_OVERRIDE=${2:-}
+                if [[ -z "${COMPLETION_THRESHOLD_OVERRIDE}" ]] || ! is_non_negative_int "${COMPLETION_THRESHOLD_OVERRIDE}"; then
+                    echo "Invalid --completion-threshold value: '${2:-}'. Expected a non-negative integer."
+                    exit 1
+                fi
+                FORWARD_ARGS+=("--completion-threshold" "$COMPLETION_THRESHOLD_OVERRIDE")
                 shift 2
                 ;;
             --max-loops)
@@ -330,8 +378,23 @@ main() {
         MIN_LOOPS="$MIN_LOOPS_OVERRIDE"
     fi
 
+    if [[ -n "$LIVE_OUTPUT_OVERRIDE" ]]; then
+        LIVE_OUTPUT="$LIVE_OUTPUT_OVERRIDE"
+    fi
+
+    if [[ -n "$COMPLETION_THRESHOLD_OVERRIDE" ]]; then
+        COMPLETION_INDICATOR_THRESHOLD="$COMPLETION_THRESHOLD_OVERRIDE"
+    fi
+
+    LIVE_OUTPUT=$(normalize_bool "$LIVE_OUTPUT")
+
     if ! is_non_negative_int "$MIN_LOOPS"; then
         echo "Invalid MIN_LOOPS value '$MIN_LOOPS' in .rafitarc. Expected a non-negative integer."
+        exit 1
+    fi
+
+    if ! is_non_negative_int "$COMPLETION_INDICATOR_THRESHOLD"; then
+        echo "Invalid COMPLETION_INDICATOR_THRESHOLD value '$COMPLETION_INDICATOR_THRESHOLD' in .rafitarc. Expected a non-negative integer."
         exit 1
     fi
 
@@ -357,6 +420,9 @@ main() {
     cb_init "$CB_NO_PROGRESS_THRESHOLD" "$CB_FAILURE_THRESHOLD" "$CB_SAME_ERROR_THRESHOLD"
 
     log_line "INFO" "Starting Rafita loop with provider '$PROVIDER'"
+    if [[ "$LIVE_OUTPUT" == "true" ]]; then
+        log_line "INFO" "Live output mode enabled."
+    fi
 
     local loop_count=0
     local finished=false
@@ -388,11 +454,11 @@ main() {
 
         rate_limit_increment
         set +e
-        provider_exec "$PROVIDER" "$runtime_prompt" "$output_file" "$TIMEOUT_MINUTES" "$PWD"
+        provider_exec "$PROVIDER" "$runtime_prompt" "$output_file" "$TIMEOUT_MINUTES" "$PWD" "$LIVE_OUTPUT"
         provider_exit=$?
         set -e
 
-        local status exit_signal tasks_completed files_modified tests_status work_type recommendation
+        local status exit_signal tasks_completed files_modified tests_status work_type recommendation completion_indicators
         if has_status_block "$output_file"; then
             status=$(get_status_value "$output_file" "STATUS" "IN_PROGRESS")
             exit_signal=$(normalize_bool "$(get_status_value "$output_file" "EXIT_SIGNAL" "false")")
@@ -410,6 +476,8 @@ main() {
             work_type="DEBUGGING"
             recommendation="Missing RAFITA_STATUS block in provider response"
         fi
+
+        completion_indicators=$(completion_indicator_count "$output_file")
 
         if [[ "$provider_exit" -eq 0 ]]; then
             cb_on_success
@@ -433,7 +501,7 @@ main() {
 
         if [[ "$status" == "COMPLETE" && "$exit_signal" == "true" ]]; then
             local gate_reason
-            gate_reason=$(completion_gate_reason "$loop_count" || true)
+            gate_reason=$(completion_gate_reason "$loop_count" "$completion_indicators" || true)
             if [[ -n "$gate_reason" ]]; then
                 log_line "INFO" "Completion requested by provider but continuing: $gate_reason"
                 status="IN_PROGRESS"
@@ -442,10 +510,10 @@ main() {
             fi
         fi
 
-        write_status_json "$loop_count" "$status" "$exit_signal" "$tasks_completed" "$files_modified" "$tests_status" "$work_type" "$recommendation" "$provider_exit"
+        write_status_json "$loop_count" "$status" "$exit_signal" "$tasks_completed" "$files_modified" "$tests_status" "$work_type" "$recommendation" "$provider_exit" "$completion_indicators"
         write_progress_json "completed" "Loop ${loop_count} finished with status ${status}"
 
-        log_line "LOOP" "#${loop_count} status=${status} exit_signal=${exit_signal} tasks=${tasks_completed} files=${files_modified} provider_exit=${provider_exit}"
+        log_line "LOOP" "#${loop_count} status=${status} exit_signal=${exit_signal} tasks=${tasks_completed} files=${files_modified} indicators=${completion_indicators} provider_exit=${provider_exit}"
 
         if cb_is_open; then
             local reason

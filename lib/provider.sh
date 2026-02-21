@@ -38,6 +38,7 @@ provider_exec() {
     local output_file=$3
     local timeout_minutes=$4
     local work_dir=$5
+    local live_output=${6:-false}
 
     local timeout_seconds=$((timeout_minutes * 60))
     local prompt_text
@@ -55,33 +56,68 @@ provider_exec() {
 
     case "$provider" in
         codex)
-            (
-                cd "$work_dir"
-                portable_timeout "${timeout_seconds}s" "${cmd_parts[@]}" exec \
-                    --sandbox workspace-write \
-                    --ask-for-approval never \
-                    -C "$work_dir" \
-                    "$prompt_text"
-            ) > "$output_file" 2>&1
+            if [[ "$live_output" == "true" ]]; then
+                (
+                    cd "$work_dir"
+                    portable_timeout "${timeout_seconds}s" "${cmd_parts[@]}" exec \
+                        --sandbox workspace-write \
+                        --ask-for-approval never \
+                        -C "$work_dir" \
+                        "$prompt_text"
+                ) 2>&1 | tee "$output_file"
+                return ${PIPESTATUS[0]}
+            else
+                (
+                    cd "$work_dir"
+                    portable_timeout "${timeout_seconds}s" "${cmd_parts[@]}" exec \
+                        --sandbox workspace-write \
+                        --ask-for-approval never \
+                        -C "$work_dir" \
+                        "$prompt_text"
+                ) > "$output_file" 2>&1
+            fi
             ;;
         kimi)
-            (
-                cd "$work_dir"
-                portable_timeout "${timeout_seconds}s" "${cmd_parts[@]}" \
-                    --print \
-                    --output-format text \
-                    --final-message-only \
-                    -w "$work_dir" \
-                    -p "$prompt_text"
-            ) > "$output_file" 2>&1
+            if [[ "$live_output" == "true" ]]; then
+                (
+                    cd "$work_dir"
+                    portable_timeout "${timeout_seconds}s" "${cmd_parts[@]}" \
+                        --print \
+                        --output-format text \
+                        --final-message-only \
+                        -w "$work_dir" \
+                        -p "$prompt_text"
+                ) 2>&1 | tee "$output_file"
+                return ${PIPESTATUS[0]}
+            else
+                (
+                    cd "$work_dir"
+                    portable_timeout "${timeout_seconds}s" "${cmd_parts[@]}" \
+                        --print \
+                        --output-format text \
+                        --final-message-only \
+                        -w "$work_dir" \
+                        -p "$prompt_text"
+                ) > "$output_file" 2>&1
+            fi
             ;;
         claude)
-            (
-                cd "$work_dir"
-                portable_timeout "${timeout_seconds}s" "${cmd_parts[@]}" \
-                    --output-format text \
-                    -p "$prompt_text"
-            ) > "$output_file" 2>&1
+            if [[ "$live_output" == "true" ]]; then
+                (
+                    cd "$work_dir"
+                    portable_timeout "${timeout_seconds}s" "${cmd_parts[@]}" \
+                        --output-format text \
+                        -p "$prompt_text"
+                ) 2>&1 | tee "$output_file"
+                return ${PIPESTATUS[0]}
+            else
+                (
+                    cd "$work_dir"
+                    portable_timeout "${timeout_seconds}s" "${cmd_parts[@]}" \
+                        --output-format text \
+                        -p "$prompt_text"
+                ) > "$output_file" 2>&1
+            fi
             ;;
         *)
             echo "Unsupported provider: $provider" > "$output_file"
